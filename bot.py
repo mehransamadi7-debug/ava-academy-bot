@@ -50,6 +50,8 @@ class Store:
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         with sqlite3.connect(self.path) as db:
             db.execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, session_json TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
+            # Aggregate-only funnel events; no user id, phone, or message text is stored here.
+            db.execute("CREATE TABLE IF NOT EXISTS funnel_events (id INTEGER PRIMARY KEY AUTOINCREMENT, event TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
     def put(self, user_id: int, session: dict[str, Any]) -> None:
         payload = json.dumps(session, ensure_ascii=False)
         with sqlite3.connect(self.path) as db:
@@ -59,10 +61,22 @@ class Store:
         with sqlite3.connect(self.path) as db:
             row = db.execute("SELECT session_json FROM users WHERE user_id=?", (int(user_id),)).fetchone()
         return json.loads(row[0]) if row else None
+    def track(self, event: str) -> None:
+        allowed = {"bot_start", "intent_selected", "quiz_started", "quiz_completed", "result_shown",
+                   "contact_prompt_shown", "contact_declined", "help_in_telegram",
+                   "contact_consent_given", "phone_submitted"}
+        if event not in allowed:
+            raise ValueError("Unsupported funnel event")
+        with sqlite3.connect(self.path) as db:
+            db.execute("INSERT INTO funnel_events(event) VALUES (?)", (event,))
+
     def summary(self) -> dict[str, int]:
         with sqlite3.connect(self.path) as db:
-            total, completed, leads = db.execute("SELECT COUNT(*), SUM(CASE WHEN json_extract(session_json,'$.state')='completed' THEN 1 ELSE 0 END), SUM(CASE WHEN json_extract(session_json,'$.consented_contact')=1 THEN 1 ELSE 0 END) FROM users").fetchone()
-        return {"users": total or 0, "completed": completed or 0, "consented_contacts": leads or 0}
+            total, completed, leads = db.execute("SELECT COUNT(*), SUM(CASE WHEN json_extract(session_json,'$.state')='completed' OR json_extract(session_json,'$.result_shown')=1 THEN 1 ELSE 0 END), SUM(CASE WHEN json_extract(session_json,'$.consented_contact')=1 THEN 1 ELSE 0 END) FROM users").fetchone()
+            events = dict(db.execute("SELECT event, COUNT(*) FROM funnel_events GROUP BY event").fetchall())
+        result = {"users": total or 0, "completed": completed or 0, "consented_contacts": leads or 0}
+        result.update({name: events.get(name, 0) for name in ("bot_start", "intent_selected", "quiz_started", "quiz_completed", "result_shown", "contact_prompt_shown", "contact_declined", "help_in_telegram", "contact_consent_given", "phone_submitted")})
+        return result
 
 STORE = Store(os.getenv("BOT_DB_PATH", "ava_bot.sqlite3"))
 user_sessions: dict[int, dict[str, Any]] = {}
@@ -91,11 +105,13 @@ def _user(update: Update):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = _user(update)
     if not user or not update.message: return
-    user_sessions[user.id] = {"state":"choosing_language", "score":0, "question_index":0}
-    save(user.id)
-    kb = [[InlineKeyboardButton("🇬🇧 انگلیسی",callback_data="lang:en"),InlineKeyboardButton("🇩🇪 آلمانی",callback_data="lang:de")],
-          [InlineKeyboardButton("🇫🇷 فرانسه",callback_data="lang:fr"),InlineKeyboardButton("🇮🇹 ایتالیایی",callback_data="lang:it")]]
-    await update.message.reply_text(f"سلام {html.escape(user.first_name or 'دوست عزیز')}! به <b>آکادمی زبان آوا</b> خوش آمدید.\nاین آزمون کوتاه آموزشی است و نتیجهٔ آن گواهی رسمی CEFR نیست.\n\nزبان موردنظر را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
+    user_sessions[user.id] = {"state":"choosing_intent", "score":0, "question_index":0}
+    save(user.id); STORE.track("bot_start")
+    kb = [[InlineKeyboardButton("می‌خواهم یادگیری را شروع/جدی‌تر کنم",callback_data="intent:learn")],
+          [InlineKeyboardButton("فقط می‌خواهم سطح مکالمه‌ام را بدانم",callback_data="intent:know")],
+          [InlineKeyboardButton("فقط کنجکاوم",callback_data="intent:curious")],
+          [InlineKeyboardButton("رد کردن و رفتن به آزمون",callback_data="intent:skip")]]
+    await update.message.reply_text(f"سلام {html.escape(user.first_name or 'دوست عزیز')}! به <b>آکادمی زبان آوا</b> خوش آمدید.\nاین آزمون کوتاه آموزشی است و برآورد آن گواهی رسمی CEFR نیست.\n\nبرای شخصی‌سازی تجربه، نیت شما چیست؟ این انتخاب اختیاری است و در هر صورت می‌توانید آزمون رایگان را انجام دهید:", reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
 
 async def send_question(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE):
     session = load(user_id)
@@ -109,12 +125,37 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not query: return
     data = query.data or ""; user_id = query.from_user.id
+    if data.startswith("intent:"):
+        intent = data.partition(":")[2]
+        labels = {"learn":"یادگیری را شروع/جدی‌تر می‌کنم", "know":"فقط می‌خواهم سطح مکالمه‌ام را بدانم", "curious":"فقط کنجکاوم"}
+        if intent == "skip":
+            session = load(user_id)
+            if not session or session.get("state") != "choosing_intent":
+                await query.answer("این مرحله فعال نیست.", show_alert=True); return
+            session.pop("intent", None); session["state"] = "choosing_language"
+            user_sessions[user_id] = session; save(user_id); await query.answer()
+            kb = [[InlineKeyboardButton("🇬🇧 انگلیسی",callback_data="lang:en"),InlineKeyboardButton("🇩🇪 آلمانی",callback_data="lang:de")],
+                  [InlineKeyboardButton("🇫🇷 فرانسه",callback_data="lang:fr"),InlineKeyboardButton("🇮🇹 ایتالیایی",callback_data="lang:it")]]
+            await query.edit_message_text("بدون ثبت نیت هم می‌توانید آزمون را انجام دهید. زبان موردنظر را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(kb)); return
+        if intent not in labels:
+            await query.answer("گزینه نامعتبر است.", show_alert=True); return
+        session = load(user_id) or {"score":0,"question_index":0}
+        if session.get("state") != "choosing_intent":
+            await query.answer("این مرحله فعال نیست.", show_alert=True); return
+        session["intent"] = intent; session["state"] = "choosing_language"; user_sessions[user_id] = session
+        save(user_id); STORE.track("intent_selected"); await query.answer()
+        kb = [[InlineKeyboardButton("🇬🇧 انگلیسی",callback_data="lang:en"),InlineKeyboardButton("🇩🇪 آلمانی",callback_data="lang:de")],
+              [InlineKeyboardButton("🇫🇷 فرانسه",callback_data="lang:fr"),InlineKeyboardButton("🇮🇹 ایتالیایی",callback_data="lang:it")]]
+        await query.edit_message_text("ممنون! انتخاب شما مانع آزمون یا دریافت نتیجه نیست.\n\nزبان موردنظر را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(kb)); return
     if data.startswith("lang:"):
         language = data.partition(":")[2]
         if language not in QUESTIONS:
             await query.answer("زبان نامعتبر است.", show_alert=True); return
+        previous = load(user_id) or {}
         user_sessions[user_id] = {"state":"quiz","language":language,"score":0,"question_index":0}
-        save(user_id); await query.answer()
+        if previous.get("intent") is not None:
+            user_sessions[user_id]["intent"] = previous["intent"]
+        save(user_id); STORE.track("quiz_started"); await query.answer()
         await query.edit_message_text(f"✅ زبان انتخابی: <b>{LANGUAGES[language]}</b>\nآزمون ۱۰ سؤالی آغاز شد.", parse_mode="HTML")
         await send_question(query.message.chat_id, user_id, context); return
     session = load(user_id)
@@ -133,26 +174,33 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_reply_markup(reply_markup=None)
         if session["question_index"] < len(QUESTIONS[lang]): await send_question(query.message.chat_id,user_id,context)
         else:
-            session["state"]="awaiting_goal"; save(user_id)
+            session["state"]="awaiting_goal"; save(user_id); STORE.track("quiz_completed")
             kb=[[InlineKeyboardButton(label,callback_data=key)] for key,label in GOALS.items()]
             await context.bot.send_message(chat_id=query.message.chat_id,text="آزمون تمام شد. هدف یادگیری خود را انتخاب کنید:",reply_markup=InlineKeyboardMarkup(kb));
         return
     if data in GOALS:
         if not session or session.get("state") != "awaiting_goal":
             await query.answer("لطفاً با /start آغاز کنید.",show_alert=True); return
-        session["goal"]=GOALS[data]; session["state"]="awaiting_contact"; save(user_id)
-        await query.answer(); await query.edit_message_reply_markup(reply_markup=None)
-        kb=ReplyKeyboardMarkup([[KeyboardButton("📱 شماره‌ام را با رضایت ارسال می‌کنم",request_contact=True)]],resize_keyboard=True,one_time_keyboard=True)
-        ikb=InlineKeyboardMarkup([[InlineKeyboardButton("بدون ارائهٔ شماره، دریافت گزارش",callback_data="contact_skip")]])
-        await context.bot.send_message(chat_id=query.message.chat_id,text="گزارش شما آماده است. ارسال شماره کاملاً اختیاری است؛ فقط با لمس دکمهٔ اشتراک‌گذاری مخاطب، شماره برای پیگیری به آوا ارسال می‌شود. می‌توانید بدون شماره گزارش را دریافت کنید.",reply_markup=kb)
-        await context.bot.send_message(chat_id=query.message.chat_id,text="انتخاب کنید:",reply_markup=ikb); return
-    if data == "contact_skip":
-        if not session or session.get("state") != "awaiting_contact":
-            await query.answer("این مرحله فعال نیست.",show_alert=True); return
-        session["state"]="completed"; session["consented_contact"]=False; save(user_id)
+        session["goal"]=GOALS[data]; session["state"]="awaiting_contact"; session["result_shown"]=True; save(user_id)
         await query.answer(); await query.edit_message_reply_markup(reply_markup=None)
         lang=LANGUAGES.get(session.get("language"),"نامشخص")
-        await context.bot.send_message(chat_id=query.message.chat_id,text=generate_attractive_report(query.from_user.first_name or "زبان‌آموز",lang,session.get("score",0),session.get("goal","نامشخص")),parse_mode="HTML",reply_markup=ReplyKeyboardRemove()); return
+        await context.bot.send_message(chat_id=query.message.chat_id,text=generate_attractive_report(query.from_user.first_name or "زبان‌آموز",lang,session.get("score",0),session.get("goal","نامشخص")),parse_mode="HTML")
+        STORE.track("result_shown")
+        kb=ReplyKeyboardMarkup([[KeyboardButton("📱 با رضایت، شماره‌ام را برای پیگیری می‌فرستم",request_contact=True)]],resize_keyboard=True,one_time_keyboard=True)
+        ikb=InlineKeyboardMarkup([[InlineKeyboardButton("راهنمایی داخل تلگرام",callback_data="contact_help")],
+                                  [InlineKeyboardButton("فعلاً تماس نمی‌خواهم",callback_data="contact_skip")]])
+        await context.bot.send_message(chat_id=query.message.chat_id,text="اگر مایل باشید، می‌توانید پس از دیدن نتیجه شماره‌تان را برای پیگیری به آوا بفرستید. ارسال شماره کاملاً اختیاری است؛ فقط با انتخاب دکمهٔ اشتراک‌گذاری مخاطب، شماره ارسال می‌شود. برای ادامه بدون تماس، یکی از گزینه‌های زیر را بزنید.",reply_markup=kb)
+        await context.bot.send_message(chat_id=query.message.chat_id,text="انتخاب با شماست:",reply_markup=ikb)
+        STORE.track("contact_prompt_shown"); return
+    if data in ("contact_skip", "contact_help"):
+        if not session or session.get("state") != "awaiting_contact":
+            await query.answer("این مرحله فعال نیست.",show_alert=True); return
+        is_help = data == "contact_help"
+        session["state"]="completed"; session["consented_contact"]=False; save(user_id)
+        STORE.track("help_in_telegram" if is_help else "contact_declined")
+        await query.answer(); await query.edit_message_reply_markup(reply_markup=None)
+        text = "حتماً؛ می‌توانید همین‌جا از ربات استفاده کنید و هر زمان خواستید دوباره /start را بزنید." if is_help else "کاملاً قابل‌درک است؛ نتیجهٔ شما محفوظ است و نیازی به ارائهٔ شماره نیست. هر زمان خواستید می‌توانید دوباره /start را بزنید."
+        await context.bot.send_message(chat_id=query.message.chat_id,text=text,reply_markup=ReplyKeyboardRemove()); return
     await query.answer("درخواست نامعتبر است.", show_alert=True)
 
 async def contact_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -162,9 +210,11 @@ async def contact_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not session or session.get("state") != "awaiting_contact":
         await message.reply_text("برای شروع، /start را ارسال کنید.",reply_markup=ReplyKeyboardRemove()); return
     contact=message.contact
-    if contact.user_id is not None and contact.user_id != user.id:
-        await message.reply_text("لطفاً فقط شمارهٔ خودتان را با رضایت ارسال کنید.",reply_markup=ReplyKeyboardRemove()); return
+    if contact.user_id != user.id:
+        await message.reply_text("لطفاً فقط مخاطب خودتان را با دکمهٔ اشتراک‌گذاری تلگرام ارسال کنید.",reply_markup=ReplyKeyboardRemove()); return
     phone=contact.phone_number
+    # Telegram's explicit share-contact action is the user's affirmative consent.
+    STORE.track("contact_consent_given"); STORE.track("phone_submitted")
     session["state"]="completed"; session["consented_contact"]=True; save(user.id)
     lang=LANGUAGES.get(session.get("language"),"نامشخص"); goal=session.get("goal","نامشخص"); score=session.get("score",0)
     await message.reply_text(generate_attractive_report(user.first_name or "زبان‌آموز",lang,score,goal),reply_markup=ReplyKeyboardRemove(),parse_mode="HTML")
@@ -190,7 +240,10 @@ async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user or not admin or str(user.id) != admin:
         await update.message.reply_text("این گزارش فقط برای مدیر پیکربندی‌شده در دسترس است."); return
     stats=STORE.summary()
-    await update.message.reply_text(f"گزارش محلی SQLite\nکاربران: {stats['users']}\nتکمیل‌شده: {stats['completed']}\nشماره‌های داوطلبانه: {stats['consented_contacts']}")
+    labels = [("bot_start","شروع بات"),("intent_selected","انتخاب نیت"),("quiz_started","شروع آزمون"),("quiz_completed","تکمیل آزمون"),("result_shown","نمایش نتیجه"),("contact_prompt_shown","نمایش درخواست تماس"),("contact_declined","رد تماس"),("help_in_telegram","راهنمایی داخل تلگرام"),("contact_consent_given","رضایت/اشتراک مخاطب"),("phone_submitted","ارسال شماره")]
+    lines = ["گزارش محلی SQLite (تعداد رویدادها؛ بدون شناسه/متن تماس در آمار قیف)", f"کاربران ذخیره‌شده: {stats['users']}", f"نتیجه‌های نمایش‌داده‌شده/تکمیل‌شده: {stats['completed']}", f"شماره‌های داوطلبانه: {stats['consented_contacts']}"]
+    lines.extend(f"{label}: {stats[key]}" for key,label in labels)
+    await update.message.reply_text("\n".join(lines))
 
 def main():
     token=os.getenv("BOT_TOKEN","").strip()
