@@ -50,6 +50,18 @@ class BotTests(unittest.TestCase):
   u,q=self.cb('contact_help'); asyncio.run(bot.callback_handler(u,self.ctx))
   self.assertEqual(bot.STORE.get(42)['state'],'completed'); self.assertEqual(bot.STORE.summary()['help_in_telegram'],2)
   self.assertFalse(bot.STORE.get(42).get('consented_contact',False))
+  self.assertEqual(bot.STORE.summary()['consultation_menu_shown'],1)
+  menu_call=self.bot.send_message.await_args_list[-1]
+  keyboard=menu_call.kwargs['reply_markup'].inline_keyboard
+  self.assertEqual([row[0].url for row in keyboard],[bot.CONSULTANT_WHATSAPP_URL,bot.CONSULTATION_URL,bot.WEBSITE_URL])
+  self.assertEqual(bot.CONSULTANT_WHATSAPP_URL,'https://wa.me/989961665190')
+  self.assertNotIn('https://t.me/',menu_call.kwargs['text'])
+  self.assertNotIn('https://t.me/',' '.join(row[0].url for row in keyboard))
+  self.assertIn('شخصاً ارسال کنید',menu_call.kwargs['text'])
+  self.assertIn('خودکار منتقل نمی‌کند',menu_call.kwargs['text'])
+  self.assertIn('تضمین‌شده‌ای وجود ندارد',menu_call.kwargs['text'])
+  self.assertEqual(bot.STORE.summary()['contact_consent_given'],0)
+  self.assertEqual(bot.STORE.summary()['phone_submitted'],0)
 
  def test_intent_selection_is_optional_path_enabled_and_report_counts(self):
   upd=obj(effective_user=self.user,message=obj(reply_text=AsyncMock()))
@@ -101,6 +113,46 @@ class BotTests(unittest.TestCase):
   self.assertEqual(cols,['id','event','created_at']); self.assertNotIn(phone,raw); self.assertNotIn(private,raw)
   self.assertNotIn(phone,' '.join(events)); self.assertNotIn(private,' '.join(events))
   self.assertEqual(events,['contact_consent_given','phone_submitted'])
+ def test_consultation_command_before_and_after_completion_is_private_guidance(self):
+  expected_urls=[bot.CONSULTANT_WHATSAPP_URL,bot.CONSULTATION_URL,bot.WEBSITE_URL]
+  self.assertEqual(bot.CONSULTANT_WHATSAPP_URL,'https://wa.me/989961665190')
+  for state in ('choosing_intent','completed'):
+   bot.user_sessions[42]={'state':state,'result_shown':state=='completed','consented_contact':False,'score':7}
+   bot.STORE.put(42,bot.user_sessions[42])
+   before=bot.STORE.summary().copy()
+   message=obj(reply_text=AsyncMock())
+   update=obj(effective_user=self.user,message=message)
+   asyncio.run(bot.consultation_command(update,self.ctx))
+   args=message.reply_text.await_args.kwargs
+   self.assertEqual([row[0].url for row in args['reply_markup'].inline_keyboard],expected_urls)
+   self.assertNotIn('https://t.me/',args['text'])
+   self.assertNotIn('https://t.me/',' '.join(row[0].url for row in args['reply_markup'].inline_keyboard))
+   self.assertIn('شخصاً ارسال کنید',args.args[0])
+   self.assertIn('خودکار منتقل نمی‌کند',args['text'])
+   after=bot.STORE.summary()
+   self.assertEqual(bot.STORE.get(42),{'state':state,'result_shown':state=='completed','consented_contact':False,'score':7})
+   self.assertEqual(after['completed'],before['completed'])
+   self.assertEqual(after['quiz_started'],before['quiz_started'])
+   self.assertEqual(after['quiz_completed'],before['quiz_completed'])
+   self.assertEqual(after['contact_consent_given'],0)
+   self.assertEqual(after['phone_submitted'],0)
+   self.assertEqual(after['consultation_menu_shown'],before['consultation_menu_shown']+1)
+
+ def test_stale_contact_callbacks_rejected_without_guidance_or_events(self):
+  bot.user_sessions[42]={'state':'completed','consented_contact':False}
+  bot.STORE.put(42,bot.user_sessions[42])
+  for action in ('contact_help','contact_skip'):
+   u,q=self.cb(action); asyncio.run(bot.callback_handler(u,self.ctx))
+   q.answer.assert_awaited_with('این مرحله فعال نیست.',show_alert=True)
+  self.assertEqual(bot.STORE.summary()['help_in_telegram'],0)
+  self.assertEqual(bot.STORE.summary()['contact_declined'],0)
+  self.assertEqual(bot.STORE.summary()['consultation_menu_shown'],0)
+
+ def test_missing_token_error_is_generic_and_contains_no_secret(self):
+  with patch.dict(os.environ,{},clear=True):
+   with self.assertRaises(RuntimeError) as caught: bot.main()
+  self.assertEqual(str(caught.exception),'BOT_TOKEN environment variable is required')
+  self.assertNotIn('secret',str(caught.exception).lower())
  def test_store_replaces_atomically_and_report_bounds(self):
   store=bot.Store(os.path.join(self.tmp.name,'other.sqlite')); store.put(8,{'state':'one'}); store.put(8,{'state':'two'}); self.assertEqual(store.get(8),{'state':'two'})
   self.assertIn('100٪',bot.generate_attractive_report('<&','en',10,'goal'))

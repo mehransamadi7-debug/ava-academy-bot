@@ -42,6 +42,9 @@ QUESTIONS = {
 ("Credo che loro ___ già partiti.",["siano","sono","erano","essere"],0),("Quando siamo arrivati, loro ___ già il negozio.",["avevano chiuso","hanno chiuso","chiudevano","chiusero"],0),
 ("Benché ___ molto stanco, ha continuato a lavorare.",["fosse","era","è","sarà"],0),("Se me l'___ detto prima, avrei potuto aiutarti.",["avessi","avrei","hai","avevi"],0)]}
 GOALS = {"goal_migration":"مهاجرت و اقامت 🌍", "goal_travel":"مکالمه و سفر ✈️", "goal_exam":"آزمون بین‌المللی 📜", "goal_career":"پیشرفت شغلی 💼", "goal_curious":"یادگیری و کنجکاوی 📚"}
+CONSULTANT_WHATSAPP_URL = os.getenv("CONSULTANT_WHATSAPP_URL", "https://wa.me/989961665190").strip()
+CONSULTATION_URL = os.getenv("CONSULTATION_URL", "https://avalanguage.net/#free-consultation").strip()
+WEBSITE_URL = os.getenv("WEBSITE_URL", "https://avalanguage.net").strip()
 
 class Store:
     """Small SQLite persistence layer. Replacing a user's snapshot is an atomic transaction."""
@@ -64,7 +67,7 @@ class Store:
     def track(self, event: str) -> None:
         allowed = {"bot_start", "intent_selected", "quiz_started", "quiz_completed", "result_shown",
                    "contact_prompt_shown", "contact_declined", "help_in_telegram",
-                   "contact_consent_given", "phone_submitted"}
+                   "contact_consent_given", "phone_submitted", "consultation_menu_shown"}
         if event not in allowed:
             raise ValueError("Unsupported funnel event")
         with sqlite3.connect(self.path) as db:
@@ -75,7 +78,7 @@ class Store:
             total, completed, leads = db.execute("SELECT COUNT(*), SUM(CASE WHEN json_extract(session_json,'$.state')='completed' OR json_extract(session_json,'$.result_shown')=1 THEN 1 ELSE 0 END), SUM(CASE WHEN json_extract(session_json,'$.consented_contact')=1 THEN 1 ELSE 0 END) FROM users").fetchone()
             events = dict(db.execute("SELECT event, COUNT(*) FROM funnel_events GROUP BY event").fetchall())
         result = {"users": total or 0, "completed": completed or 0, "consented_contacts": leads or 0}
-        result.update({name: events.get(name, 0) for name in ("bot_start", "intent_selected", "quiz_started", "quiz_completed", "result_shown", "contact_prompt_shown", "contact_declined", "help_in_telegram", "contact_consent_given", "phone_submitted")})
+        result.update({name: events.get(name, 0) for name in ("bot_start", "intent_selected", "quiz_started", "quiz_completed", "result_shown", "contact_prompt_shown", "contact_declined", "help_in_telegram", "contact_consent_given", "phone_submitted", "consultation_menu_shown")})
         return result
 
 STORE = Store(os.getenv("BOT_DB_PATH", "ava_bot.sqlite3"))
@@ -99,6 +102,38 @@ def generate_attractive_report(user_first_name: str, language_name: str, score: 
             f"سطح پیشنهادیِ تقریبی: <b>{indicative}</b> (برآورد مقدماتی، نه گواهی CEFR).\n\n"
             "این آزمون کوتاه فقط چند نکتهٔ دستوری را می‌سنجد و به‌تنهایی سطح زبان را به‌طور معتبر تعیین نمی‌کند. برای ارزیابی دقیق‌تر، مهارت گفتاری، شنیداری، خواندن و نوشتن نیز باید سنجیده شوند.\n"
             "برای ادامهٔ یادگیری، می‌توانید هدف خود را مرور کنید و با تمرین منظم پیش بروید.")
+
+def consultation_menu_keyboard() -> InlineKeyboardMarkup:
+    """External consultation options; opening a link is not recorded as a lead."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("گفت‌وگو با مشاور در واتساپ", url=CONSULTANT_WHATSAPP_URL)],
+        [InlineKeyboardButton("درخواست مشاوره در وب‌سایت", url=CONSULTATION_URL)],
+        [InlineKeyboardButton("دوره‌ها و وب‌سایت آوا", url=WEBSITE_URL)],
+    ])
+
+async def show_consultation_menu(message, *, track: bool = True, bot=None) -> None:
+    """Send actionable options through a message or its chat when reply_text is unavailable."""
+    text = ("برای دریافت مشاوره یکی از راه‌های زیر را انتخاب کنید. "
+            "برای مشاوره در واتساپ، گفت‌وگو با مشاور را باز کنید و پیام خود را شخصاً ارسال کنید؛ "
+            "ربات هیچ پیامی را خودکار منتقل نمی‌کند. زمان پاسخ‌گویی تضمین‌شده‌ای وجود ندارد. "
+            "بازشدن لینک یا ارسال فرم در این ربات قابل مشاهده یا شمارش نیست.")
+    markup = consultation_menu_keyboard()
+    reply_text = getattr(message, "reply_text", None)
+    if callable(reply_text):
+        await reply_text(text, reply_markup=markup)
+    else:
+        chat_id = getattr(message, "chat_id", None)
+        if chat_id is None:
+            chat_id = getattr(getattr(message, "chat", None), "id", None)
+        if bot is None or chat_id is None:
+            raise ValueError("Cannot send consultation menu: no reply method or chat sender")
+        await bot.send_message(chat_id=chat_id, text=text, reply_markup=markup)
+    if track:
+        STORE.track("consultation_menu_shown")
+
+async def consultation_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message:
+        await show_consultation_menu(update.message)
 
 def _user(update: Update):
     return update.effective_user
@@ -199,8 +234,16 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         session["state"]="completed"; session["consented_contact"]=False; save(user_id)
         STORE.track("help_in_telegram" if is_help else "contact_declined")
         await query.answer(); await query.edit_message_reply_markup(reply_markup=None)
-        text = "حتماً؛ می‌توانید همین‌جا از ربات استفاده کنید و هر زمان خواستید دوباره /start را بزنید." if is_help else "کاملاً قابل‌درک است؛ نتیجهٔ شما محفوظ است و نیازی به ارائهٔ شماره نیست. هر زمان خواستید می‌توانید دوباره /start را بزنید."
-        await context.bot.send_message(chat_id=query.message.chat_id,text=text,reply_markup=ReplyKeyboardRemove()); return
+        if is_help:
+            await context.bot.send_message(chat_id=query.message.chat_id,
+                text="نتیجهٔ شما همچنان در دسترس است و ارائهٔ شماره لازم نیست.",
+                reply_markup=ReplyKeyboardRemove())
+            await show_consultation_menu(query.message, track=True, bot=context.bot)
+        else:
+            await context.bot.send_message(chat_id=query.message.chat_id,
+                text="کاملاً قابل‌درک است؛ نتیجهٔ شما محفوظ است و نیازی به ارائهٔ شماره نیست. هر زمان خواستید می‌توانید دوباره /start را بزنید.",
+                reply_markup=ReplyKeyboardRemove())
+        return
     await query.answer("درخواست نامعتبر است.", show_alert=True)
 
 async def contact_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -240,17 +283,18 @@ async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user or not admin or str(user.id) != admin:
         await update.message.reply_text("این گزارش فقط برای مدیر پیکربندی‌شده در دسترس است."); return
     stats=STORE.summary()
-    labels = [("bot_start","شروع بات"),("intent_selected","انتخاب نیت"),("quiz_started","شروع آزمون"),("quiz_completed","تکمیل آزمون"),("result_shown","نمایش نتیجه"),("contact_prompt_shown","نمایش درخواست تماس"),("contact_declined","رد تماس"),("help_in_telegram","راهنمایی داخل تلگرام"),("contact_consent_given","رضایت/اشتراک مخاطب"),("phone_submitted","ارسال شماره")]
+    labels = [("bot_start","شروع بات"),("intent_selected","انتخاب نیت"),("quiz_started","شروع آزمون"),("quiz_completed","تکمیل آزمون"),("result_shown","نمایش نتیجه"),("contact_prompt_shown","نمایش درخواست تماس"),("contact_declined","رد تماس"),("help_in_telegram","انتخاب راهنمایی تلگرام (نه مشاورهٔ دریافت‌شده)"),("consultation_menu_shown","نمایش منوی مشاوره (کلیک/فرم قابل‌شمارش نیست)"),("contact_consent_given","رضایت/اشتراک مخاطب"),("phone_submitted","ارسال شماره")]
     lines = ["گزارش محلی SQLite (تعداد رویدادها؛ بدون شناسه/متن تماس در آمار قیف)", f"کاربران ذخیره‌شده: {stats['users']}", f"نتیجه‌های نمایش‌داده‌شده/تکمیل‌شده: {stats['completed']}", f"شماره‌های داوطلبانه: {stats['consented_contacts']}"]
     lines.extend(f"{label}: {stats[key]}" for key,label in labels)
     await update.message.reply_text("\n".join(lines))
 
 def main():
     token=os.getenv("BOT_TOKEN","").strip()
-    if not token: raise RuntimeError("متغیر BOT_TOKEN تنظیم نشده است.")
+    if not token: raise RuntimeError("BOT_TOKEN environment variable is required")
     app=Application.builder().token(token).build()
     app.add_handler(CommandHandler("start",start))
     app.add_handler(CommandHandler("report",report_command))
+    app.add_handler(CommandHandler("consultation",consultation_command))
     app.add_handler(CallbackQueryHandler(callback_handler))  # one callback handler; it routes all callback_data
     app.add_handler(MessageHandler(filters.CONTACT,contact_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,text_handler))
