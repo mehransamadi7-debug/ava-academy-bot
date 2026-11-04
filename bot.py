@@ -67,7 +67,8 @@ class Store:
     def track(self, event: str) -> None:
         allowed = {"bot_start", "intent_selected", "quiz_started", "quiz_completed", "result_shown",
                    "contact_prompt_shown", "contact_declined", "help_in_telegram",
-                   "contact_consent_given", "phone_submitted", "consultation_menu_shown"}
+                   "contact_consent_given", "phone_submitted", "consultation_menu_shown",
+                   "advisor_option_shown_start", "advisor_option_shown_result"}
         if event not in allowed:
             raise ValueError("Unsupported funnel event")
         with sqlite3.connect(self.path) as db:
@@ -78,7 +79,7 @@ class Store:
             total, completed, leads = db.execute("SELECT COUNT(*), SUM(CASE WHEN json_extract(session_json,'$.state')='completed' OR json_extract(session_json,'$.result_shown')=1 THEN 1 ELSE 0 END), SUM(CASE WHEN json_extract(session_json,'$.consented_contact')=1 THEN 1 ELSE 0 END) FROM users").fetchone()
             events = dict(db.execute("SELECT event, COUNT(*) FROM funnel_events GROUP BY event").fetchall())
         result = {"users": total or 0, "completed": completed or 0, "consented_contacts": leads or 0}
-        result.update({name: events.get(name, 0) for name in ("bot_start", "intent_selected", "quiz_started", "quiz_completed", "result_shown", "contact_prompt_shown", "contact_declined", "help_in_telegram", "contact_consent_given", "phone_submitted", "consultation_menu_shown")})
+        result.update({name: events.get(name, 0) for name in ("bot_start", "intent_selected", "quiz_started", "quiz_completed", "result_shown", "contact_prompt_shown", "contact_declined", "help_in_telegram", "contact_consent_given", "phone_submitted", "consultation_menu_shown", "advisor_option_shown_start", "advisor_option_shown_result")})
         return result
 
 STORE = Store(os.getenv("BOT_DB_PATH", "ava_bot.sqlite3"))
@@ -107,6 +108,20 @@ def consultation_menu_keyboard() -> InlineKeyboardMarkup:
     """External consultation options; opening a link is not recorded as a lead."""
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("گفت‌وگو با مشاور در واتساپ", url=CONSULTANT_WHATSAPP_URL)],
+        [InlineKeyboardButton("درخواست مشاوره در وب‌سایت", url=CONSULTATION_URL)],
+        [InlineKeyboardButton("دوره‌ها و وب‌سایت آوا", url=WEBSITE_URL)],
+    ])
+
+ADVISOR_BUTTON_LABEL = "گفت‌وگو با مشاور در واتساپ"
+
+def advisor_button() -> InlineKeyboardButton:
+    """Direct, user-initiated WhatsApp link. Opening it is not observable by the bot."""
+    return InlineKeyboardButton(ADVISOR_BUTTON_LABEL, url=CONSULTANT_WHATSAPP_URL)
+
+def result_keyboard() -> InlineKeyboardMarkup:
+    """Primary direct advisor CTA first, then secondary website options."""
+    return InlineKeyboardMarkup([
+        [advisor_button()],
         [InlineKeyboardButton("درخواست مشاوره در وب‌سایت", url=CONSULTATION_URL)],
         [InlineKeyboardButton("دوره‌ها و وب‌سایت آوا", url=WEBSITE_URL)],
     ])
@@ -141,12 +156,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = _user(update)
     if not user or not update.message: return
     user_sessions[user.id] = {"state":"choosing_intent", "score":0, "question_index":0}
-    save(user.id); STORE.track("bot_start")
-    kb = [[InlineKeyboardButton("می‌خواهم یادگیری را شروع/جدی‌تر کنم",callback_data="intent:learn")],
+    save(user.id); STORE.track("bot_start"); STORE.track("advisor_option_shown_start")
+    kb = [[advisor_button()],
+          [InlineKeyboardButton("می‌خواهم یادگیری را شروع/جدی‌تر کنم",callback_data="intent:learn")],
           [InlineKeyboardButton("فقط می‌خواهم سطح مکالمه‌ام را بدانم",callback_data="intent:know")],
           [InlineKeyboardButton("فقط کنجکاوم",callback_data="intent:curious")],
           [InlineKeyboardButton("رد کردن و رفتن به آزمون",callback_data="intent:skip")]]
-    await update.message.reply_text(f"سلام {html.escape(user.first_name or 'دوست عزیز')}! به <b>آکادمی زبان آوا</b> خوش آمدید.\nاین آزمون کوتاه آموزشی است و برآورد آن گواهی رسمی CEFR نیست.\n\nبرای شخصی‌سازی تجربه، نیت شما چیست؟ این انتخاب اختیاری است و در هر صورت می‌توانید آزمون رایگان را انجام دهید:", reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
+    await update.message.reply_text(f"سلام {html.escape(user.first_name or 'دوست عزیز')}! به <b>آکادمی زبان آوا</b> خوش آمدید.\nاین آزمون کوتاه آموزشی است و برآورد آن گواهی رسمی CEFR نیست.\n\nبرای شخصی‌سازی تجربه، نیت شما چیست؟ این انتخاب اختیاری است و در هر صورت می‌توانید آزمون رایگان را انجام دهید.\nاگر همین حالا می‌خواهید مستقیم با مشاور در واتساپ گفت‌وگو کنید، بدون آزمون و بدون ارائهٔ شماره به ربات، دکمهٔ «گفت‌وگو با مشاور در واتساپ» را بزنید؛ گفت‌وگو را خودتان آغاز می‌کنید و ربات بازشدن لینک را نمی‌بیند و شمارش نمی‌کند.", reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
 
 async def send_question(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE):
     session = load(user_id)
@@ -219,12 +235,15 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         session["goal"]=GOALS[data]; session["state"]="awaiting_contact"; session["result_shown"]=True; save(user_id)
         await query.answer(); await query.edit_message_reply_markup(reply_markup=None)
         lang=LANGUAGES.get(session.get("language"),"نامشخص")
-        await context.bot.send_message(chat_id=query.message.chat_id,text=generate_attractive_report(query.from_user.first_name or "زبان‌آموز",lang,session.get("score",0),session.get("goal","نامشخص")),parse_mode="HTML")
-        STORE.track("result_shown")
-        kb=ReplyKeyboardMarkup([[KeyboardButton("📱 با رضایت، شماره‌ام را برای پیگیری می‌فرستم",request_contact=True)]],resize_keyboard=True,one_time_keyboard=True)
-        ikb=InlineKeyboardMarkup([[InlineKeyboardButton("راهنمایی داخل تلگرام",callback_data="contact_help")],
+        await context.bot.send_message(chat_id=query.message.chat_id,
+            text=generate_attractive_report(query.from_user.first_name or "زبان‌آموز",lang,session.get("score",0),session.get("goal","نامشخص"))
+                 + "\n\nبرای گفت‌وگوی مستقیم با مشاور در واتساپ، دکمهٔ زیر را بزنید؛ آزمون، انتخاب نیت یا ارسال شماره به ربات لازم نیست. گفت‌وگو را خودتان آغاز می‌کنید و ربات بازشدن لینک یا ارسال پیام در واتساپ را نمی‌بیند و شمارش نمی‌کند. گزینه‌های فرم مشاوره و وب‌سایت آوا هم در ادامهٔ همان دکمه‌ها موجود است.",
+            parse_mode="HTML", reply_markup=result_keyboard())
+        STORE.track("result_shown"); STORE.track("advisor_option_shown_result")
+        kb=ReplyKeyboardMarkup([[KeyboardButton("📱 (اختیاری) با رضایت، شماره‌ام را برای پیگیری می‌فرستم",request_contact=True)]],resize_keyboard=True,one_time_keyboard=True)
+        ikb=InlineKeyboardMarkup([[InlineKeyboardButton("راهنمایی و گزینه‌های مشاوره",callback_data="contact_help")],
                                   [InlineKeyboardButton("فعلاً تماس نمی‌خواهم",callback_data="contact_skip")]])
-        await context.bot.send_message(chat_id=query.message.chat_id,text="اگر مایل باشید، می‌توانید پس از دیدن نتیجه شماره‌تان را برای پیگیری به آوا بفرستید. ارسال شماره کاملاً اختیاری است؛ فقط با انتخاب دکمهٔ اشتراک‌گذاری مخاطب، شماره ارسال می‌شود. برای ادامه بدون تماس، یکی از گزینه‌های زیر را بزنید.",reply_markup=kb)
+        await context.bot.send_message(chat_id=query.message.chat_id,text="ارسال شماره کاملاً اختیاری است و برای دیدن نتیجه یا گفت‌وگو با مشاور در واتساپ لازم نیست؛ گفت‌وگوی واتساپ را خودتان آغاز می‌کنید. فقط اگر خودتان دکمهٔ اشتراک‌گذاری مخاطب را بزنید، شمارهٔ خودتان برای پیگیری به ربات ارسال می‌شود. برای ادامهٔ گفت‌وگو با مشاور، از دکمهٔ واتساپ در همان پیام نتیجه استفاده کنید یا گزینه‌های زیر را بزنید.",reply_markup=kb)
         await context.bot.send_message(chat_id=query.message.chat_id,text="انتخاب با شماست:",reply_markup=ikb)
         STORE.track("contact_prompt_shown"); return
     if data in ("contact_skip", "contact_help"):
@@ -283,7 +302,7 @@ async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user or not admin or str(user.id) != admin:
         await update.message.reply_text("این گزارش فقط برای مدیر پیکربندی‌شده در دسترس است."); return
     stats=STORE.summary()
-    labels = [("bot_start","شروع بات"),("intent_selected","انتخاب نیت"),("quiz_started","شروع آزمون"),("quiz_completed","تکمیل آزمون"),("result_shown","نمایش نتیجه"),("contact_prompt_shown","نمایش درخواست تماس"),("contact_declined","رد تماس"),("help_in_telegram","انتخاب راهنمایی تلگرام (نه مشاورهٔ دریافت‌شده)"),("consultation_menu_shown","نمایش منوی مشاوره (کلیک/فرم قابل‌شمارش نیست)"),("contact_consent_given","رضایت/اشتراک مخاطب"),("phone_submitted","ارسال شماره")]
+    labels = [("bot_start","شروع بات"),("intent_selected","انتخاب نیت"),("quiz_started","شروع آزمون"),("quiz_completed","تکمیل آزمون"),("result_shown","نمایش نتیجه"),("contact_prompt_shown","نمایش درخواست تماس"),("contact_declined","رد تماس"),("help_in_telegram","انتخاب راهنمایی تلگرام (نه مشاورهٔ دریافت‌شده)"),("consultation_menu_shown","نمایش منوی مشاوره (کلیک/فرم قابل‌شمارش نیست)"),("contact_consent_given","رضایت/اشتراک مخاطب"),("phone_submitted","ارسال شماره"),("advisor_option_shown_start","نمایش دکمهٔ واتساپ مشاور در پیام /start (فقط نمایش؛ کلیک/گفت‌وگو قابل‌شمارش نیست)"),("advisor_option_shown_result","نمایش دکمهٔ واتساپ مشاور همراه نتیجه (فقط نمایش؛ کلیک/گفت‌وگو قابل‌شمارش نیست)")]
     lines = ["گزارش محلی SQLite (تعداد رویدادها؛ بدون شناسه/متن تماس در آمار قیف)", f"کاربران ذخیره‌شده: {stats['users']}", f"نتیجه‌های نمایش‌داده‌شده/تکمیل‌شده: {stats['completed']}", f"شماره‌های داوطلبانه: {stats['consented_contacts']}"]
     lines.extend(f"{label}: {stats[key]}" for key,label in labels)
     await update.message.reply_text("\n".join(lines))

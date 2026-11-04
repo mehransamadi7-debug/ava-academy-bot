@@ -123,12 +123,12 @@ class BotTests(unittest.TestCase):
    message=obj(reply_text=AsyncMock())
    update=obj(effective_user=self.user,message=message)
    asyncio.run(bot.consultation_command(update,self.ctx))
-   args=message.reply_text.await_args.kwargs
+   call=message.reply_text.await_args; args=call.kwargs; text=call.args[0]
    self.assertEqual([row[0].url for row in args['reply_markup'].inline_keyboard],expected_urls)
-   self.assertNotIn('https://t.me/',args['text'])
+   self.assertNotIn('https://t.me/',text)
    self.assertNotIn('https://t.me/',' '.join(row[0].url for row in args['reply_markup'].inline_keyboard))
-   self.assertIn('شخصاً ارسال کنید',args.args[0])
-   self.assertIn('خودکار منتقل نمی‌کند',args['text'])
+   self.assertIn('شخصاً ارسال کنید',text)
+   self.assertIn('خودکار منتقل نمی‌کند',text)
    after=bot.STORE.summary()
    self.assertEqual(bot.STORE.get(42),{'state':state,'result_shown':state=='completed','consented_contact':False,'score':7})
    self.assertEqual(after['completed'],before['completed'])
@@ -157,4 +157,53 @@ class BotTests(unittest.TestCase):
   store=bot.Store(os.path.join(self.tmp.name,'other.sqlite')); store.put(8,{'state':'one'}); store.put(8,{'state':'two'}); self.assertEqual(store.get(8),{'state':'two'})
   self.assertIn('100٪',bot.generate_attractive_report('<&','en',10,'goal'))
   self.assertIn('0٪',bot.generate_attractive_report('x','en',0,'g'))
+
+ def test_start_direct_advisor_button_and_quiz_choices(self):
+  upd=obj(effective_user=self.user,message=obj(reply_text=AsyncMock()))
+  asyncio.run(bot.start(upd,self.ctx))
+  call=upd.message.reply_text.await_args
+  kb=call.kwargs['reply_markup'].inline_keyboard
+  self.assertEqual(kb[0][0].text,bot.ADVISOR_BUTTON_LABEL)
+  self.assertEqual(kb[0][0].url,bot.CONSULTANT_WHATSAPP_URL)
+  callbacks=[row[0].callback_data for row in kb[1:]]
+  self.assertEqual(callbacks,['intent:learn','intent:know','intent:curious','intent:skip'])
+  self.assertEqual(bot.STORE.get(42)['state'],'choosing_intent')
+  self.assertEqual(bot.STORE.summary()['advisor_option_shown_start'],1)
+  self.assertIn('بدون آزمون',call.args[0])
+  self.assertIn('ربات بازشدن لینک را نمی‌بیند',call.args[0])
+
+ def test_result_direct_advisor_is_on_result_for_all_languages_without_phone(self):
+  for lang in bot.LANGUAGES:
+   bot.user_sessions[42]={'state':'awaiting_goal','language':lang,'score':4,'goal':'هدف'}
+   bot.STORE.put(42,bot.user_sessions[42])
+   before=len(self.bot.send_message.await_args_list)
+   u,q=self.cb('goal_curious'); asyncio.run(bot.callback_handler(u,self.ctx))
+   calls=self.bot.send_message.await_args_list[before:]
+   report=next(c for c in calls if 'آزمون کوتاه آوا' in c.kwargs.get('text',''))
+   buttons=report.kwargs['reply_markup'].inline_keyboard
+   self.assertEqual(buttons[0][0].text,bot.ADVISOR_BUTTON_LABEL)
+   self.assertEqual(buttons[0][0].url,bot.CONSULTANT_WHATSAPP_URL)
+   self.assertEqual([row[0].url for row in buttons[1:]],[bot.CONSULTATION_URL,bot.WEBSITE_URL])
+   self.assertIn('برآورد مقدماتی',report.kwargs['text'])
+   self.assertEqual(bot.STORE.get(42)['state'],'awaiting_contact')
+   self.assertFalse(bot.STORE.get(42).get('consented_contact',False))
+   prompt=next(c for c in calls if 'ارسال شماره کاملاً اختیاری' in c.kwargs.get('text',''))
+   self.assertIn('خودتان آغاز می‌کنید',prompt.kwargs['text'])
+   self.assertIn('اختیاری',prompt.kwargs['reply_markup'].keyboard[0][0].text)
+   self.assertEqual(bot.STORE.summary()['advisor_option_shown_result'],list(bot.LANGUAGES).index(lang)+1)
+   bot.user_sessions.pop(42,None)
+
+ def test_advisor_events_whitelisted_and_reported_as_impressions(self):
+  store=bot.Store(os.path.join(self.tmp.name,'events.sqlite'))
+  store.track('advisor_option_shown_start'); store.track('advisor_option_shown_result')
+  self.assertEqual(store.summary()['advisor_option_shown_start'],1)
+  with self.assertRaises(ValueError): store.track('whatsapp_clicked')
+  bot.STORE=store
+  upd=obj(effective_user=obj(id=1),message=obj(reply_text=AsyncMock()))
+  with patch.dict(os.environ,{'ADMIN_CHAT_ID':'1'}): asyncio.run(bot.report_command(upd,self.ctx))
+  text=upd.message.reply_text.await_args.args[0]
+  self.assertIn('نمایش دکمهٔ واتساپ مشاور در پیام /start (فقط نمایش',text)
+  self.assertIn('نمایش دکمهٔ واتساپ مشاور همراه نتیجه (فقط نمایش',text)
+  self.assertNotIn('کلیک/گفت‌وگو: 1',text)
+
 if __name__=='__main__': unittest.main()
